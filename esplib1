@@ -35,6 +35,7 @@ local ESP_SETTINGS = {
     Teamcheck = false,
     WallCheck = false,
     GhostCheck = false,
+    AliveCheck = false,
     Enabled = false,
     ShowBox = false,
     BoxType = "2D",
@@ -158,6 +159,19 @@ local function isPlayerGhosted(player)
     return true
 end
 
+local function isPlayerAlive(player)
+    local character = player.Character
+    if not character then
+        return false
+    end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then
+        return false
+    end
+
+    return humanoid.Health > 0
+end
 
 local function removeEsp(player)
     local esp = cache[player]
@@ -179,7 +193,8 @@ local function updateEsp()
             local humanoid = character:FindFirstChild("Humanoid")
             local isBehindWall = ESP_SETTINGS.WallCheck and isPlayerBehindWall(player)
             local ghosted = ESP_SETTINGS.GhostCheck and isPlayerGhosted(player)
-            local shouldShow = not isBehindWall and ESP_SETTINGS.Enabled and not ghosted
+            local alive = ESP_SETTINGS.AliveCheck and isPlayerAlive(player)
+            local shouldShow = not isBehindWall and ESP_SETTINGS.Enabled and not ghosted and not alive
             if rootPart and head and humanoid and shouldShow then
                 local position, onScreen = camera:WorldToViewportPoint(rootPart.Position)
                 if onScreen then
