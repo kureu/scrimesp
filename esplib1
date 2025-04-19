@@ -122,14 +122,9 @@ local function isPlayerBehindWall(player)
     return hit and hit:IsA("Part")
 end
 
-local function isGhosted(player)
+local function isPlayerGhosted(player)
     local character = player.Character
     if not character then
-        return false
-    end
-
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if not humanoid then
         return false
     end
 
@@ -138,25 +133,29 @@ local function isGhosted(player)
         return false
     end
 
-    local headMesh = head:FindFirstChild("Mesh")
-    if headMesh then
-        if head.Transparency > 0.5 or headMesh.Scale == Vector3.new(0.01, 0.01, 0.01) then
-            return true
-        end
-    else
-        if head.Transparency > 0.5 then
+    -- check transparency of head
+    if head.Transparency >= 0.9 then
+        return true
+    end
 
-            for _, child in pairs(head:GetChildren()) do
-                if child:IsA("Decal") and child.Transparency > 0.5 then
-                    return true
-                elseif child:IsA("LayerCollector") and not child.Enabled then
-                    return true
-                end
-            end
+    -- check head mesh scale
+    local headMesh = head:FindFirstChild("Mesh")
+    if headMesh and headMesh:IsA("SpecialMesh") then
+        if headMesh.Scale == Vector3.new(0.01, 0.01, 0.01) then
+            return true
         end
     end
 
-    return false
+    -- check for hidden decals or disabled face layers
+    for _, child in pairs(head:GetChildren()) do
+        if child:IsA("Decal") and child.Transparency < 1 then
+            return false
+        elseif child:IsA("LayerCollector") and child.Enabled then
+            return false
+        end
+    end
+
+    return true
 end
 
 
@@ -179,8 +178,8 @@ local function updateEsp()
             local head = character:FindFirstChild("Head")
             local humanoid = character:FindFirstChild("Humanoid")
             local isBehindWall = ESP_SETTINGS.WallCheck and isPlayerBehindWall(player)
-            local InvisibleCheck = ESP_SETTINGS.GhostCheck and isGhosted(player)
-            local shouldShow = not isBehindWall and ESP_SETTINGS.Enabled and not isGhosted
+            local ghosted = ESP_SETTINGS.GhostCheck and isPlayerGhosted(player)
+            local shouldShow = not isBehindWall and ESP_SETTINGS.Enabled and not ghosted
             if rootPart and head and humanoid and shouldShow then
                 local position, onScreen = camera:WorldToViewportPoint(rootPart.Position)
                 if onScreen then
