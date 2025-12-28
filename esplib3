@@ -1,165 +1,254 @@
---// Refactored & Bug-Fixed ESP Instance Class
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local localPlayer = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+--// Configuration
+local ESP = {
+    Enabled = false,
+    TeamCheck = false,
+    WallCheck = false,
+    GhostCheck = false,
+    AliveCheck = true,
+    
+    Settings = {
+        BoxColor = Color3.fromRGB(255, 255, 255),
+        BoxOutlineColor = Color3.fromRGB(0, 0, 0),
+        BoxType = "2D", -- "2D" or "Corner"
+        NameColor = Color3.fromRGB(255, 255, 255),
+        ShowName = false,
+        HealthHighColor = Color3.fromRGB(0, 255, 0),
+        HealthLowColor = Color3.fromRGB(255, 0, 0),
+        ShowHealth = false,
+        ShowDistance = false,
+        ShowTracer = false,
+        TracerColor = Color3.fromRGB(255, 255, 255),
+        TracerPosition = "Bottom",
+        ShowSkeletons = false,
+        SkeletonsColor = Color3.fromRGB(255, 255, 255),
+    }
+}
+
+local Cache = {}
+local BONES = {
+    {"Head", "UpperTorso"}, {"UpperTorso", "RightUpperArm"}, {"RightUpperArm", "RightLowerArm"},
+    {"RightLowerArm", "RightHand"}, {"UpperTorso", "LeftUpperArm"}, {"LeftUpperArm", "LeftLowerArm"},
+    {"LeftLowerArm", "LeftHand"}, {"UpperTorso", "LowerTorso"}, {"LowerTorso", "LeftUpperLeg"},
+    {"LeftUpperLeg", "LeftLowerLeg"}, {"LeftLowerLeg", "LeftFoot"}, {"LowerTorso", "RightUpperLeg"},
+    {"RightUpperLeg", "RightLowerLeg"}, {"RightLowerLeg", "RightFoot"},
+    -- R6 Compatibility
+    {"Head", "Torso"}, {"Torso", "Left Arm"}, {"Torso", "Right Arm"}, 
+    {"Torso", "Left Leg"}, {"Torso", "Right Leg"}
+}
+
+--// Helper: Robust Drawing Check
+local function SetVisible(obj, state)
+    if not obj then return end
+    if typeof(obj) == "table" and obj.Visible ~= nil then
+        obj.Visible = state
+    elseif typeof(obj) == "userdata" then
+        -- Use pcall to handle executors with non-standard Drawing properties
+        pcall(function() obj.Visible = state end)
+    end
+end
+
+local function CreateDrawing(class, props)
+    local d = Drawing.new(class)
+    for k, v in pairs(props) do d[k] = v end
+    return d
+end
+
+local function IsVisible(char)
+    if not ESP.WallCheck then return true end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {localPlayer.Character, char}
+    local res = workspace:Raycast(camera.CFrame.Position, (root.Position - camera.CFrame.Position), params)
+    return res == nil
+end
+
+--// ESP Instance
 local ESPInstance = {}
 ESPInstance.__index = ESPInstance
 
 function ESPInstance.new(player)
     local self = setmetatable({}, ESPInstance)
     self.Player = player
-    self.Components = {
+    self.Drawings = {
         Box = CreateDrawing("Square", {Thickness = 1, Filled = false, ZIndex = 2}),
-        BoxOutline = CreateDrawing("Square", {Thickness = 3, Color = Color3.new(0,0,0), Filled = false, ZIndex = 1}),
+        Outline = CreateDrawing("Square", {Thickness = 3, Color = Color3.new(0,0,0), Filled = false, ZIndex = 1}),
         Name = CreateDrawing("Text", {Size = 13, Center = true, Outline = true, ZIndex = 2}),
-        Distance = CreateDrawing("Text", {Size = 12, Center = true, Outline = true, ZIndex = 2}),
-        Tracer = CreateDrawing("Line", {Thickness = 1, Transparency = 1, ZIndex = 2}),
-        HealthBar = CreateDrawing("Line", {Thickness = 1, ZIndex = 2}),
-        HealthOutline = CreateDrawing("Line", {Thickness = 3, Color = Color3.new(0,0,0), ZIndex = 1}),
-        SkeletonLines = {}, -- Only Drawing objects go here now
-        CornerLines = {}    -- Only Drawing objects go here now
+        Dist = CreateDrawing("Text", {Size = 12, Center = true, Outline = true, ZIndex = 2}),
+        Tracer = CreateDrawing("Line", {Thickness = 1, ZIndex = 2}),
+        Health = CreateDrawing("Line", {Thickness = 1, ZIndex = 2}),
+        HealthOut = CreateDrawing("Line", {Thickness = 3, Color = Color3.new(0,0,0), ZIndex = 1}),
     }
+    self.SkeletonLines = {}
+    self.CornerLines = {}
     return self
 end
 
 function ESPInstance:Update()
-    local player = self.Player
-    local char = player.Character
-    local components = self.Components
+    local char = self.Player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
     
-    -- Safety Helper: Only sets Visibility on actual Drawing objects
-    local function setVisibility(obj, state)
-        if typeof(obj) == "table" then
-            for _, child in pairs(obj) do
-                if typeof(child) == "userdata" then
-                    child.Visible = state
-                end
-            end
-        elseif typeof(obj) == "userdata" then
-            obj.Visible = state
-        end
+    -- Cleanup/Hide Helper
+    local function hideAll()
+        for _, d in pairs(self.Drawings) do SetVisible(d, false) end
+        for _, l in pairs(self.SkeletonLines) do SetVisible(l, false) end
+        for _, c in pairs(self.CornerLines) do SetVisible(c, false) end
     end
 
-    local function setAllVisible(state)
-        for _, comp in pairs(components) do
-            setVisibility(comp, state)
-        end
-    end
-
-    -- 1. Check if ESP is enabled/valid
-    if not ESP.Enabled or not char or (ESP.TeamCheck and player.Team == localPlayer.Team) then
-        setAllVisible(false)
+    if not ESP.Enabled or not root or not hum or (ESP.AliveCheck and hum.Health <= 0) or (ESP.TeamCheck and self.Player.Team == localPlayer.Team) then
+        hideAll()
         return
     end
 
-    -- 2. Check Humanoid and Health
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not root or not hum or (ESP.AliveCheck and hum.Health <= 0) then
-        setAllVisible(false)
-        return
-    end
-
-    -- 3. On-Screen and Wall Check
     local pos, onScreen = camera:WorldToViewportPoint(root.Position)
-    if not onScreen or not IsVisible(player, char) then
-        setAllVisible(false)
+    if not onScreen or not IsVisible(char) then
+        hideAll()
         return
     end
 
-    -- 4. Ghost Check
-    if ESP.GhostCheck then
-        local head = char:FindFirstChild("Head")
-        if head and head.Transparency > 0.8 then
-            setAllVisible(false)
-            return
-        end
-    end
-
-    -- Calculate screen bounds
+    -- Calculations
     local head = char:FindFirstChild("Head")
     local headPos = camera:WorldToViewportPoint(head and (head.Position + Vector3.new(0, 0.5, 0)) or (root.Position + Vector3.new(0, 3, 0)))
     local legPos = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 3, 0))
-    
-    local height = math.abs(headPos.Y - legPos.Y)
-    local width = height * 0.6
-    local size = Vector2.new(width, height)
-    local position = Vector2.new(pos.X - width/2, pos.Y - height/2)
+    local h = math.abs(headPos.Y - legPos.Y)
+    local w = h * 0.6
+    local size = Vector2.new(w, h)
+    local screenPos = Vector2.new(pos.X - w/2, pos.Y - h/2)
 
-    -- Box Logic
+    -- Render Box
     if ESP.Settings.ShowBox then
         if ESP.Settings.BoxType == "2D" then
-            components.Box.Visible = true
-            components.BoxOutline.Visible = true
-            components.Box.Size = size
-            components.Box.Position = position
-            components.Box.Color = ESP.Settings.BoxColor
-            components.BoxOutline.Size = size
-            components.BoxOutline.Position = position
-            setVisibility(components.CornerLines, false)
+            self.Drawings.Box.Visible = true
+            self.Drawings.Box.Size = size
+            self.Drawings.Box.Position = screenPos
+            self.Drawings.Box.Color = ESP.Settings.BoxColor
+            self.Drawings.Outline.Visible = true
+            self.Drawings.Outline.Size = size
+            self.Drawings.Outline.Position = screenPos
+            for _, c in pairs(self.CornerLines) do SetVisible(c, false) end
         else
-            components.Box.Visible = false
-            components.BoxOutline.Visible = false
-            self:UpdateCorners(position, size)
+            self.Drawings.Box.Visible = false
+            self.Drawings.Outline.Visible = false
+            self:UpdateCorners(screenPos, size)
         end
     else
-        components.Box.Visible = false
-        components.BoxOutline.Visible = false
-        setVisibility(components.CornerLines, false)
+        self.Drawings.Box.Visible = false
+        self.Drawings.Outline.Visible = false
+        for _, c in pairs(self.CornerLines) do SetVisible(c, false) end
     end
 
-    -- Name & Distance
+    -- Name/Dist
     if ESP.Settings.ShowName then
-        components.Name.Visible = true
-        components.Name.Text = player.Name:lower()
-        components.Name.Position = Vector2.new(pos.X, position.Y - 16)
-        components.Name.Color = ESP.Settings.NameColor
-    else components.Name.Visible = false end
+        self.Drawings.Name.Visible = true
+        self.Drawings.Name.Text = self.Player.Name:lower()
+        self.Drawings.Name.Position = Vector2.new(pos.X, screenPos.Y - 16)
+        self.Drawings.Name.Color = ESP.Settings.NameColor
+    else self.Drawings.Name.Visible = false end
 
     if ESP.Settings.ShowDistance then
-        components.Distance.Visible = true
-        components.Distance.Text = math.floor((camera.CFrame.Position - root.Position).Magnitude) .. " studs"
-        components.Distance.Position = Vector2.new(pos.X, position.Y + height + 2)
-    else components.Distance.Visible = false end
+        self.Drawings.Dist.Visible = true
+        self.Drawings.Dist.Text = math.floor((camera.CFrame.Position - root.Position).Magnitude) .. " studs"
+        self.Drawings.Dist.Position = Vector2.new(pos.X, screenPos.Y + h + 2)
+    else self.Drawings.Dist.Visible = false end
 
     -- Health
     if ESP.Settings.ShowHealth then
-        local healthPct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
-        components.HealthOutline.Visible = true
-        components.HealthOutline.From = Vector2.new(position.X - 5, position.Y + height)
-        components.HealthOutline.To = Vector2.new(position.X - 5, position.Y)
-        
-        components.HealthBar.Visible = true
-        components.HealthBar.From = Vector2.new(position.X - 5, position.Y + height)
-        components.HealthBar.To = Vector2.new(position.X - 5, position.Y + height - (height * healthPct))
-        components.HealthBar.Color = ESP.Settings.HealthLowColor:Lerp(ESP.Settings.HealthHighColor, healthPct)
+        local hp = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+        self.Drawings.HealthOut.Visible = true
+        self.Drawings.HealthOut.From = Vector2.new(screenPos.X - 5, screenPos.Y + h)
+        self.Drawings.HealthOut.To = Vector2.new(screenPos.X - 5, screenPos.Y)
+        self.Drawings.Health.Visible = true
+        self.Drawings.Health.From = Vector2.new(screenPos.X - 5, screenPos.Y + h)
+        self.Drawings.Health.To = Vector2.new(screenPos.X - 5, screenPos.Y + h - (h * hp))
+        self.Drawings.Health.Color = ESP.Settings.HealthLowColor:Lerp(ESP.Settings.HealthHighColor, hp)
     else
-        components.HealthBar.Visible = false
-        components.HealthOutline.Visible = false
+        self.Drawings.Health.Visible = false
+        self.Drawings.HealthOut.Visible = false
     end
 
     -- Tracer
     if ESP.Settings.ShowTracer then
-        local targetY = (ESP.Settings.TracerPosition == "Top" and 0) or (ESP.Settings.TracerPosition == "Middle" and camera.ViewportSize.Y / 2) or camera.ViewportSize.Y
-        components.Tracer.Visible = true
-        components.Tracer.From = Vector2.new(camera.ViewportSize.X / 2, targetY)
-        components.Tracer.To = Vector2.new(pos.X, pos.Y)
-    else components.Tracer.Visible = false end
+        local tY = (ESP.Settings.TracerPosition == "Top" and 0) or (ESP.Settings.TracerPosition == "Middle" and camera.ViewportSize.Y / 2) or camera.ViewportSize.Y
+        self.Drawings.Tracer.Visible = true
+        self.Drawings.Tracer.From = Vector2.new(camera.ViewportSize.X / 2, tY)
+        self.Drawings.Tracer.To = Vector2.new(pos.X, pos.Y)
+        self.Drawings.Tracer.Color = ESP.Settings.TracerColor
+    else self.Drawings.Tracer.Visible = false end
 
     -- Skeleton
     if ESP.Settings.ShowSkeletons then
         self:UpdateSkeleton(char)
     else
-        setVisibility(components.SkeletonLines, false)
+        for _, l in pairs(self.SkeletonLines) do SetVisible(l, false) end
+    end
+end
+
+function ESPInstance:UpdateSkeleton(char)
+    local idx = 1
+    for _, pair in ipairs(BONES) do
+        local p1, p2 = char:FindFirstChild(pair[1]), char:FindFirstChild(pair[2])
+        if p1 and p2 then
+            local pos1, v1 = camera:WorldToViewportPoint(p1.Position)
+            local pos2, v2 = camera:WorldToViewportPoint(p2.Position)
+            if v1 and v2 then
+                local line = self.SkeletonLines[idx]
+                if not line then
+                    line = CreateDrawing("Line", {Thickness = 1, Color = ESP.Settings.SkeletonsColor})
+                    self.SkeletonLines[idx] = line
+                end
+                line.Visible = true
+                line.From = Vector2.new(pos1.X, pos1.Y)
+                line.To = Vector2.new(pos2.X, pos2.Y)
+                line.Color = ESP.Settings.SkeletonsColor
+                idx = idx + 1
+            end
+        end
+    end
+    for i = idx, #self.SkeletonLines do SetVisible(self.SkeletonLines[i], false) end
+end
+
+function ESPInstance:UpdateCorners(pos, size)
+    if #self.CornerLines < 8 then
+        for i = 1, 8 do table.insert(self.CornerLines, CreateDrawing("Line", {Thickness = 1, Color = ESP.Settings.BoxColor})) end
+    end
+    local x, y, w, h = pos.X, pos.Y, size.X, size.Y
+    local l = w / 4
+    local p = {
+        {Vector2.new(x, y), Vector2.new(x+l, y)}, {Vector2.new(x, y), Vector2.new(x, y+l)},
+        {Vector2.new(x+w, y), Vector2.new(x+w-l, y)}, {Vector2.new(x+w, y), Vector2.new(x+w, y+l)},
+        {Vector2.new(x, y+h), Vector2.new(x+l, y+h)}, {Vector2.new(x, y+h), Vector2.new(x, y+h-l)},
+        {Vector2.new(x+w, y+h), Vector2.new(x+w-l, y+h)}, {Vector2.new(x+w, y+h), Vector2.new(x+w, y+h-l)}
+    }
+    for i, pts in ipairs(p) do
+        local line = self.CornerLines[i]
+        line.Visible = true
+        line.From, line.To = pts[1], pts[2]
+        line.Color = ESP.Settings.BoxColor
     end
 end
 
 function ESPInstance:Destroy()
-    for _, comp in pairs(self.Components) do
-        if typeof(comp) == "table" then
-            for _, obj in pairs(comp) do 
-                if typeof(obj) == "userdata" then obj:Remove() end 
-            end
-        elseif typeof(comp) == "userdata" then
-            comp:Remove()
-        end
-    end
-    self.Components = nil
+    for _, d in pairs(self.Drawings) do d:Remove() end
+    for _, l in pairs(self.SkeletonLines) do l:Remove() end
+    for _, c in pairs(self.CornerLines) do c:Remove() end
 end
+
+--// Init
+local function Add(p) if p ~= localPlayer then Cache[p] = ESPInstance.new(p) end end
+local function Remove(p) if Cache[p] then Cache[p]:Destroy() Cache[p] = nil end end
+
+Players.PlayerAdded:Connect(Add)
+Players.PlayerRemoving:Connect(Remove)
+for _, p in ipairs(Players:GetPlayers()) do Add(p) end
+RunService.RenderStepped:Connect(function() 
+    for _, inst in pairs(Cache) do inst:Update() end 
+end)
+
+return ESP
