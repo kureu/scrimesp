@@ -1,73 +1,4 @@
---// Refactored ESP Library
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local localPlayer = Players.LocalPlayer
-local camera = workspace.CurrentCamera
-
---// Configuration
-local ESP = {
-    Enabled = false,
-    TeamCheck = false,
-    WallCheck = false,
-    GhostCheck = false,
-    AliveCheck = false,
-    
-    Settings = {
-        BoxColor = Color3.fromRGB(255, 255, 255),
-        BoxOutlineColor = Color3.fromRGB(0, 0, 0),
-        BoxType = "2D", -- "2D" or "Corner"
-        
-        NameColor = Color3.fromRGB(255, 255, 255),
-        ShowName = false,
-        
-        HealthHighColor = Color3.fromRGB(0, 255, 0),
-        HealthLowColor = Color3.fromRGB(255, 0, 0),
-        ShowHealth = false,
-        
-        ShowDistance = false,
-        ShowTracer = false,
-        TracerColor = Color3.fromRGB(255, 255, 255),
-        TracerPosition = "Bottom", -- "Top", "Middle", "Bottom"
-        
-        ShowSkeletons = false,
-        SkeletonsColor = Color3.fromRGB(255, 255, 255),
-    }
-}
-
-local Cache = {}
-
---// Constants
-local BONES = {
-    {"Head", "UpperTorso"}, {"UpperTorso", "RightUpperArm"}, {"RightUpperArm", "RightLowerArm"},
-    {"RightLowerArm", "RightHand"}, {"UpperTorso", "LeftUpperArm"}, {"LeftUpperArm", "LeftLowerArm"},
-    {"LeftLowerArm", "LeftHand"}, {"UpperTorso", "LowerTorso"}, {"LowerTorso", "LeftUpperLeg"},
-    {"LeftUpperLeg", "LeftLowerLeg"}, {"LeftLowerLeg", "LeftFoot"}, {"LowerTorso", "RightUpperLeg"},
-    {"RightUpperLeg", "RightLowerLeg"}, {"RightLowerLeg", "RightFoot"}
-}
-
---// Utilities
-local function CreateDrawing(class, properties)
-    local drawing = Drawing.new(class)
-    for prop, val in pairs(properties) do
-        drawing[prop] = val
-    end
-    return drawing
-end
-
-local function IsVisible(player, character)
-    if not ESP.WallCheck then return true end
-    local root = character:FindFirstChild("HumanoidRootPart")
-    if not root then return false end
-    
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = {localPlayer.Character, character}
-    
-    local result = workspace:Raycast(camera.CFrame.Position, (root.Position - camera.CFrame.Position), params)
-    return result == nil
-end
-
---// ESP Instance Class
+--// Refactored & Bug-Fixed ESP Instance Class
 local ESPInstance = {}
 ESPInstance.__index = ESPInstance
 
@@ -82,8 +13,8 @@ function ESPInstance.new(player)
         Tracer = CreateDrawing("Line", {Thickness = 1, Transparency = 1, ZIndex = 2}),
         HealthBar = CreateDrawing("Line", {Thickness = 1, ZIndex = 2}),
         HealthOutline = CreateDrawing("Line", {Thickness = 3, Color = Color3.new(0,0,0), ZIndex = 1}),
-        SkeletonLines = {},
-        CornerLines = {}
+        SkeletonLines = {}, -- Only Drawing objects go here now
+        CornerLines = {}    -- Only Drawing objects go here now
     }
     return self
 end
@@ -93,44 +24,58 @@ function ESPInstance:Update()
     local char = player.Character
     local components = self.Components
     
-    -- Visibility Logic
-    local function setAllVisible(state)
-        for _, comp in pairs(components) do
-            if typeof(comp) == "table" then
-                for _, line in pairs(comp) do line.Visible = state end
-            else
-                comp.Visible = state
+    -- Safety Helper: Only sets Visibility on actual Drawing objects
+    local function setVisibility(obj, state)
+        if typeof(obj) == "table" then
+            for _, child in pairs(obj) do
+                if typeof(child) == "userdata" then
+                    child.Visible = state
+                end
             end
+        elseif typeof(obj) == "userdata" then
+            obj.Visible = state
         end
     end
 
+    local function setAllVisible(state)
+        for _, comp in pairs(components) do
+            setVisibility(comp, state)
+        end
+    end
+
+    -- 1. Check if ESP is enabled/valid
     if not ESP.Enabled or not char or (ESP.TeamCheck and player.Team == localPlayer.Team) then
         setAllVisible(false)
         return
     end
 
+    -- 2. Check Humanoid and Health
+    local hum = char:FindFirstChildOfClass("Humanoid")
     local root = char:FindFirstChild("HumanoidRootPart")
-    local hum = char:FindFirstChild("Humanoid")
     if not root or not hum or (ESP.AliveCheck and hum.Health <= 0) then
         setAllVisible(false)
         return
     end
 
+    -- 3. On-Screen and Wall Check
     local pos, onScreen = camera:WorldToViewportPoint(root.Position)
     if not onScreen or not IsVisible(player, char) then
         setAllVisible(false)
         return
     end
 
-    -- Ghost Check Optimization
-    if ESP.GhostCheck and char:FindFirstChild("Head") and char.Head.Transparency > 0.8 then
-        setAllVisible(false)
-        return
+    -- 4. Ghost Check
+    if ESP.GhostCheck then
+        local head = char:FindFirstChild("Head")
+        if head and head.Transparency > 0.8 then
+            setAllVisible(false)
+            return
+        end
     end
 
-    -- Calculations
+    -- Calculate screen bounds
     local head = char:FindFirstChild("Head")
-    local headPos = camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.5, 0))
+    local headPos = camera:WorldToViewportPoint(head and (head.Position + Vector3.new(0, 0.5, 0)) or (root.Position + Vector3.new(0, 3, 0)))
     local legPos = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 3, 0))
     
     local height = math.abs(headPos.Y - legPos.Y)
@@ -138,7 +83,7 @@ function ESPInstance:Update()
     local size = Vector2.new(width, height)
     local position = Vector2.new(pos.X - width/2, pos.Y - height/2)
 
-    -- Box Render
+    -- Box Logic
     if ESP.Settings.ShowBox then
         if ESP.Settings.BoxType == "2D" then
             components.Box.Visible = true
@@ -148,10 +93,8 @@ function ESPInstance:Update()
             components.Box.Color = ESP.Settings.BoxColor
             components.BoxOutline.Size = size
             components.BoxOutline.Position = position
-            -- Hide corner lines if they exist
-            for _, v in pairs(components.CornerLines) do v.Visible = false end
+            setVisibility(components.CornerLines, false)
         else
-            -- Corner Box Logic (Simplified for performance)
             components.Box.Visible = false
             components.BoxOutline.Visible = false
             self:UpdateCorners(position, size)
@@ -159,7 +102,7 @@ function ESPInstance:Update()
     else
         components.Box.Visible = false
         components.BoxOutline.Visible = false
-        for _, v in pairs(components.CornerLines) do v.Visible = false end
+        setVisibility(components.CornerLines, false)
     end
 
     -- Name & Distance
@@ -172,22 +115,20 @@ function ESPInstance:Update()
 
     if ESP.Settings.ShowDistance then
         components.Distance.Visible = true
-        components.Distance.Text = math.floor((camera.CFrame.Position - root.Position).Magnitude) .. "m"
+        components.Distance.Text = math.floor((camera.CFrame.Position - root.Position).Magnitude) .. " studs"
         components.Distance.Position = Vector2.new(pos.X, position.Y + height + 2)
     else components.Distance.Visible = false end
 
-    -- Health Bar
+    -- Health
     if ESP.Settings.ShowHealth then
-        local healthPct = hum.Health / hum.MaxHealth
-        local barHeight = height * healthPct
-        
+        local healthPct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
         components.HealthOutline.Visible = true
         components.HealthOutline.From = Vector2.new(position.X - 5, position.Y + height)
         components.HealthOutline.To = Vector2.new(position.X - 5, position.Y)
         
         components.HealthBar.Visible = true
         components.HealthBar.From = Vector2.new(position.X - 5, position.Y + height)
-        components.HealthBar.To = Vector2.new(position.X - 5, position.Y + height - barHeight)
+        components.HealthBar.To = Vector2.new(position.X - 5, position.Y + height - (height * healthPct))
         components.HealthBar.Color = ESP.Settings.HealthLowColor:Lerp(ESP.Settings.HealthHighColor, healthPct)
     else
         components.HealthBar.Visible = false
@@ -200,109 +141,25 @@ function ESPInstance:Update()
         components.Tracer.Visible = true
         components.Tracer.From = Vector2.new(camera.ViewportSize.X / 2, targetY)
         components.Tracer.To = Vector2.new(pos.X, pos.Y)
-        components.Tracer.Color = ESP.Settings.TracerColor
     else components.Tracer.Visible = false end
 
-    -- Skeleton Render
+    -- Skeleton
     if ESP.Settings.ShowSkeletons then
         self:UpdateSkeleton(char)
     else
-        for _, v in pairs(components.SkeletonLines) do v.Visible = false end
-    end
-end
-
-function ESPInstance:UpdateSkeleton(char)
-    local count = 1
-    for _, pair in ipairs(BONES) do
-        local p1, p2 = char:FindFirstChild(pair[1]), char:FindFirstChild(pair[2])
-        if p1 and p2 then
-            local pos1, vis1 = camera:WorldToViewportPoint(p1.Position)
-            local pos2, vis2 = camera:WorldToViewportPoint(p2.Position)
-            
-            if vis1 and vis2 then
-                local line = self.Components.SkeletonLines[count]
-                if not line then
-                    line = CreateDrawing("Line", {Thickness = 1, Color = ESP.Settings.SkeletonsColor})
-                    self.Components.SkeletonLines[count] = line
-                end
-                line.Visible = true
-                line.From = Vector2.new(pos1.X, pos1.Y)
-                line.To = Vector2.new(pos2.X, pos2.Y)
-                line.Color = ESP.Settings.SkeletonsColor
-                count = count + 1
-            end
-        end
-    end
-    -- Hide unused lines
-    for i = count, #self.Components.SkeletonLines do
-        self.Components.SkeletonLines[i].Visible = false
-    end
-end
-
-function ESPInstance:UpdateCorners(pos, size)
-    -- Utility to manage 8 lines for corners
-    if #self.Components.CornerLines == 0 then
-        for i = 1, 8 do
-            table.insert(self.Components.CornerLines, CreateDrawing("Line", {Thickness = 1, Color = ESP.Settings.BoxColor}))
-        end
-    end
-    
-    local lines = self.Components.CornerLines
-    local x, y, w, h = pos.X, pos.Y, size.X, size.Y
-    local lineLen = w / 4
-    
-    local points = {
-        {Vector2.new(x, y), Vector2.new(x + lineLen, y)},
-        {Vector2.new(x, y), Vector2.new(x, y + lineLen)},
-        {Vector2.new(x + w, y), Vector2.new(x + w - lineLen, y)},
-        {Vector2.new(x + w, y), Vector2.new(x + w, y + lineLen)},
-        {Vector2.new(x, y + h), Vector2.new(x + lineLen, y + h)},
-        {Vector2.new(x, y + h), Vector2.new(x, y + h - lineLen)},
-        {Vector2.new(x + w, y + h), Vector2.new(x + w - lineLen, y + h)},
-        {Vector2.new(x + w, y + h), Vector2.new(x + w, y + h - lineLen)}
-    }
-
-    for i, p in ipairs(points) do
-        lines[i].Visible = true
-        lines[i].From = p[1]
-        lines[i].To = p[2]
-        lines[i].Color = ESP.Settings.BoxColor
+        setVisibility(components.SkeletonLines, false)
     end
 end
 
 function ESPInstance:Destroy()
     for _, comp in pairs(self.Components) do
         if typeof(comp) == "table" then
-            for _, line in pairs(comp) do line:Remove() end
-        else
+            for _, obj in pairs(comp) do 
+                if typeof(obj) == "userdata" then obj:Remove() end 
+            end
+        elseif typeof(comp) == "userdata" then
             comp:Remove()
         end
     end
     self.Components = nil
 end
-
---// Logic Controller
-local function AddPlayer(player)
-    if player == localPlayer then return end
-    Cache[player] = ESPInstance.new(player)
-end
-
-local function RemovePlayer(player)
-    if Cache[player] then
-        Cache[player]:Destroy()
-        Cache[player] = nil
-    end
-end
-
---// Initialization
-Players.PlayerAdded:Connect(AddPlayer)
-Players.PlayerRemoving:Connect(RemovePlayer)
-for _, p in ipairs(Players:GetPlayers()) do AddPlayer(p) end
-
-RunService.RenderStepped:Connect(function()
-    for _, instance in pairs(Cache) do
-        instance:Update()
-    end
-end)
-
-return ESP
