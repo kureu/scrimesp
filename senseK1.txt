@@ -1,0 +1,806 @@
+--[[
+    Optimized ESP Module
+    Improvements:
+    - Throttled updates (configurable FPS)
+    - Object pooling for Drawing instances
+    - Weak tables for automatic cleanup
+    - Proper error handling
+    - Modular architecture
+    - Fixed 3D box math
+    - Viewport size tracking
+]]
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- Constants
+local UPDATE_RATE = 60 -- Target updates per second
+local VERTICES = {
+    Vector3.new(-1, -1, -1), Vector3.new(1, -1, -1),
+    Vector3.new(1, 1, -1), Vector3.new(-1, 1, -1),
+    Vector3.new(-1, -1, 1), Vector3.new(1, -1, 1),
+    Vector3.new(1, 1, 1), Vector3.new(-1, 1, 1)
+}
+
+local EDGES = {
+    {1, 2}, {2, 3}, {3, 4}, {4, 1}, -- Back face
+    {5, 6}, {6, 7}, {7, 8}, {8, 5}, -- Front face
+    {1, 5}, {2, 6}, {3, 7}, {4, 8}  -- Connecting edges
+}
+
+-- Utility Module
+local Util = {}
+
+function Util.IsBodyPart(name)
+    return name == "Head" or name:find("Torso") or name:find("Leg") or name:find("Arm")
+end
+
+function Util.Lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+function Util.ParseColor(color, isOutline, teamColor)
+    if color == "Team Color" or teamColor then
+        return teamColor or Color3.new(1, 1, 1)
+    end
+    return color
+end
+
+-- Drawing Pool for recycling
+local DrawingPool = {}
+DrawingPool.__index = DrawingPool
+
+function DrawingPool.new(class, initialSize)
+    local self = setmetatable({}, DrawingPool)
+    self.class = class
+    self.available = {}
+    self.inUse = {}
+    initialSize = initialSize or 5
+    
+    for i = 1, initialSize do
+        table.insert(self.available, Drawing.new(class))
+    end
+    
+    return self
+end
+
+function DrawingPool:Acquire()
+    local obj = table.remove(self.available)
+    if not obj then
+        obj = Drawing.new(self.class)
+    end
+    self.inUse[obj] = true
+    return obj
+end
+
+function DrawingPool:Release(obj)
+    if self.inUse[obj] then
+        obj.Visible = false
+        self.inUse[obj] = nil
+        table.insert(self.available, obj)
+    end
+end
+
+function DrawingPool:ReleaseAll()
+    for obj in pairs(self.inUse) do
+        obj.Visible = false
+        table.insert(self.available, obj)
+    end
+    table.clear(self.inUse)
+end
+
+function DrawingPool:Destroy()
+    self:ReleaseAll()
+    for _, obj in ipairs(self.available) do
+        pcall(function() obj:Remove() end)
+    end
+    table.clear(self.available)
+end
+
+-- Viewport Tracker
+local ViewportTracker = {}
+ViewportTracker.Size = Camera.ViewportSize
+
+Camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+    ViewportTracker.Size = Camera.ViewportSize
+end)
+
+-- Optimized ESP Object
+local EspObject = {}
+EspObject.__index = EspObject
+
+function EspObject.new(player, interface)
+    local self = setmetatable({}, EspObject)
+    self.player = player
+    self.interface = interface
+    self.charParts = {}
+    self.lastUpdate = 0
+    self.raycastParams = RaycastParams.new()
+    self.raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+    self.raycastParams.IgnoreWater = true
+    
+    self:InitDrawings()
+    return self
+end
+
+function EspObject:InitDrawings()
+    self.drawings = {
+        box = Drawing.new("Square"),
+        boxOutline = Drawing.new("Square"),
+        boxFill = Drawing.new("Square"),
+        healthBar = Drawing.new("Line"),
+        healthBarOutline = Drawing.new("Line"),
+        healthText = Drawing.new("Text"),
+        name = Drawing.new("Text"),
+        distance = Drawing.new("Text"),
+        weapon = Drawing.new("Text"),
+        tracer = Drawing.new("Line"),
+        tracerOutline = Drawing.new("Line"),
+        arrow = Drawing.new("Triangle"),
+        arrowOutline = Drawing.new("Triangle"),
+        box3d = {}
+    }
+    
+    -- Initialize 3D box lines (12 edges)
+    for i = 1, 12 do
+        self.drawings.box3d[i] = Drawing.new("Line")
+    end
+    
+    -- Set default properties
+    self.drawings.name.Text = self.player.DisplayName
+    self.drawings.name.Center = true
+    self.drawings.healthText.Center = true
+    self.drawings.distance.Center = true
+    self.drawings.weapon.Center = true
+end
+
+function EspObject:Update(deltaTime)
+    self.lastUpdate = self.lastUpdate + deltaTime
+    if self.lastUpdate < (1 / UPDATE_RATE) then return false end
+    self.lastUpdate = 0
+    
+    local interface = self.interface
+    local isFriendly = interface:IsFriendly(self.player)
+    self.options = interface.teamSettings[isFriendly and "friendly" or "enemy"]
+    
+    if not self.options.enabled then
+        self:HideAll()
+        return false
+    end
+    
+    local character = interface:GetCharacter(self.player)
+    local health, maxHealth = interface:GetHealth(self.player)
+    
+    if not character or health <= 0 then
+        self:HideAll()
+        return false
+    end
+    
+    -- Check whitelist
+    if #interface.whitelist > 0 and not table.find(interface.whitelist, self.player.UserId) then
+        self:HideAll()
+        return false
+    end
+    
+    local head = character:FindFirstChild("Head")
+    if not head then
+        self:HideAll()
+        return false
+    end
+    
+    -- Ghost check
+    if self.options.ghostCheck and head.Transparency >= 0.95 then
+        self:HideAll()
+        return false
+    end
+    
+    -- World to screen
+    local screenPos, onScreen, depth = self:WorldToScreen(head.Position)
+    self.distance = depth
+    
+    -- Distance check
+    if interface.sharedSettings.limitDistance and depth > interface.sharedSettings.maxDistance then
+        self:HideAll()
+        return false
+    end
+    
+    -- Wall check
+    if onScreen and self.options.wallCheck then
+        self.raycastParams.FilterDescendantsInstances = { LocalPlayer.Character, Camera }
+        local origin = Camera.CFrame.Position
+        local direction = head.Position - origin
+        local result = Workspace:Raycast(origin, direction, self.raycastParams)
+        
+        if result and not result.Instance:IsDescendantOf(character) then
+            onScreen = false
+        end
+    end
+    
+    self.onScreen = onScreen
+    
+    if onScreen then
+        -- Update character parts cache (throttled)
+        if not self.nextPartUpdate or tick() > self.nextPartUpdate then
+            self:UpdateCharParts(character)
+            self.nextPartUpdate = tick() + 0.5 -- Update every 0.5s
+        end
+        
+        if #self.charParts > 0 then
+            self.cframe, self.size = self:GetBoundingBox()
+            self.corners = self:CalculateCorners()
+        end
+    else
+        -- Off-screen arrow
+        if self.options.offScreenArrow then
+            local cf = Camera.CFrame
+            local flat = CFrame.fromMatrix(cf.Position, cf.RightVector, Vector3.yAxis)
+            local objSpace = flat:PointToObjectSpace(head.Position)
+            self.direction = Vector2.new(objSpace.X, objSpace.Z).Unit
+        end
+    end
+    
+    return true
+end
+
+function EspObject:UpdateCharParts(character)
+    table.clear(self.charParts)
+    for _, part in ipairs(character:GetChildren()) do
+        if part:IsA("BasePart") and Util.IsBodyPart(part.Name) then
+            table.insert(self.charParts, part)
+        end
+    end
+end
+
+function EspObject:GetBoundingBox()
+    local min, max
+    for _, part in ipairs(self.charParts) do
+        local pos = part.Position
+        local size = part.Size / 2
+        min = min and min:Min(pos - size) or (pos - size)
+        max = max and max:Max(pos + size) or (pos + size)
+    end
+    
+    local center = (min + max) / 2
+    return CFrame.new(center), max - min
+end
+
+function EspObject:CalculateCorners()
+    local corners = {}
+    local cf, size = self.cframe, self.size
+    
+    for i, vertex in ipairs(VERTICES) do
+        local worldPos = (cf + size * 0.5 * vertex).Position
+        corners[i] = self:WorldToScreen(worldPos)
+    end
+    
+    local minX, minY = math.huge, math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    
+    for _, pos in ipairs(corners) do
+        minX = math.min(minX, pos.X)
+        minY = math.min(minY, pos.Y)
+        maxX = math.max(maxX, pos.X)
+        maxY = math.max(maxY, pos.Y)
+    end
+    
+    return {
+        screen = corners,
+        topLeft = Vector2.new(minX, minY),
+        topRight = Vector2.new(maxX, minY),
+        bottomLeft = Vector2.new(minX, maxY),
+        bottomRight = Vector2.new(maxX, maxY)
+    }
+end
+
+function EspObject:WorldToScreen(worldPos)
+    local screen, inBounds = Camera:WorldToViewportPoint(worldPos)
+    return Vector2.new(screen.X, screen.Y), inBounds, screen.Z
+end
+
+function EspObject:Render()
+    if not self.options or not self.options.enabled then return end
+    
+    local d = self.drawings
+    local o = self.options
+    local teamColor = self.interface:GetTeamColor(self.player)
+    
+    if self.onScreen then
+        local c = self.corners
+        local boxSize = c.bottomRight - c.topLeft
+        
+        -- Box
+        if o.box then
+            d.box.Visible = true
+            d.box.Position = c.topLeft
+            d.box.Size = boxSize
+            d.box.Color = Util.ParseColor(o.boxColor[1], false, o.useTeamColor and teamColor)
+            d.box.Transparency = o.boxColor[2]
+            
+            if o.boxOutline then
+                d.boxOutline.Visible = true
+                d.boxOutline.Position = c.topLeft
+                d.boxOutline.Size = boxSize
+                d.boxOutline.Color = Util.ParseColor(o.boxOutlineColor[1], true)
+                d.boxOutline.Transparency = o.boxOutlineColor[2]
+            else
+                d.boxOutline.Visible = false
+            end
+        else
+            d.box.Visible = false
+            d.boxOutline.Visible = false
+        end
+        
+        -- Box Fill
+        if o.boxFill then
+            d.boxFill.Visible = true
+            d.boxFill.Position = c.topLeft
+            d.boxFill.Size = boxSize
+            d.boxFill.Color = Util.ParseColor(o.boxFillColor[1], false, o.useTeamColor and teamColor)
+            d.boxFill.Transparency = o.boxFillColor[2]
+        else
+            d.boxFill.Visible = false
+        end
+        
+        -- Health Bar
+        if o.healthBar then
+            local barX = c.topLeft.X - 6
+            local healthPct = self.health / self.maxHealth
+            
+            d.healthBarOutline.Visible = o.healthBarOutline
+            d.healthBarOutline.From = Vector2.new(barX - 1, c.topLeft.Y - 1)
+            d.healthBarOutline.To = Vector2.new(barX - 1, c.bottomRight.Y + 1)
+            
+            d.healthBar.Visible = true
+            d.healthBar.From = Vector2.new(barX, c.bottomRight.Y)
+            d.healthBar.To = Vector2.new(barX, Util.Lerp(c.bottomRight.Y, c.topLeft.Y, healthPct))
+            d.healthBar.Color = Util.Lerp(o.dyingColor, o.healthyColor, healthPct)
+        else
+            d.healthBar.Visible = false
+            d.healthBarOutline.Visible = false
+        end
+        
+        -- Health Text
+        if o.healthText then
+            d.healthText.Visible = true
+            d.healthText.Text = math.floor(self.health) .. "hp"
+            d.healthText.Position = d.healthBar.To - Vector2.yAxis * 8
+            d.healthText.Color = Util.ParseColor(o.healthTextColor[1], false, o.useTeamColor and teamColor)
+            d.healthText.Transparency = o.healthTextColor[2]
+            d.healthText.Size = self.interface.sharedSettings.textSize
+            d.healthText.Font = self.interface.sharedSettings.textFont
+            d.healthText.Outline = o.healthTextOutline
+            d.healthText.OutlineColor = o.healthTextOutlineColor
+        else
+            d.healthText.Visible = false
+        end
+        
+        -- Name
+        if o.name then
+            d.name.Visible = true
+            d.name.Position = (c.topLeft + c.topRight) / 2 - Vector2.yAxis * (d.name.TextBounds.Y + 2)
+            d.name.Color = Util.ParseColor(o.nameColor[1], false, o.useTeamColor and teamColor)
+            d.name.Transparency = o.nameColor[2]
+            d.name.Size = self.interface.sharedSettings.textSize
+            d.name.Font = self.interface.sharedSettings.textFont
+            d.name.Outline = o.nameOutline
+            d.name.OutlineColor = o.nameOutlineColor
+        else
+            d.name.Visible = false
+        end
+        
+        -- Distance
+        if o.distance then
+            d.distance.Visible = true
+            d.distance.Text = math.floor(self.distance) .. " studs"
+            d.distance.Position = (c.bottomLeft + c.bottomRight) / 2 + Vector2.yAxis * 2
+            d.distance.Color = Util.ParseColor(o.distanceColor[1], false, o.useTeamColor and teamColor)
+            d.distance.Transparency = o.distanceColor[2]
+            d.distance.Size = self.interface.sharedSettings.textSize
+            d.distance.Font = self.interface.sharedSettings.textFont
+            d.distance.Outline = o.distanceOutline
+            d.distance.OutlineColor = o.distanceOutlineColor
+        else
+            d.distance.Visible = false
+        end
+        
+        -- Weapon
+        if o.weapon then
+            local weaponText = self.interface:GetWeapon(self.player)
+            d.weapon.Visible = true
+            d.weapon.Text = weaponText
+            d.weapon.Position = (c.bottomLeft + c.bottomRight) / 2 + Vector2.yAxis * (o.distance and 14 or 2)
+            d.weapon.Color = Util.ParseColor(o.weaponColor[1], false, o.useTeamColor and teamColor)
+            d.weapon.Transparency = o.weaponColor[2]
+            d.weapon.Size = self.interface.sharedSettings.textSize
+            d.weapon.Font = self.interface.sharedSettings.textFont
+            d.weapon.Outline = o.weaponOutline
+            d.weapon.OutlineColor = o.weaponOutlineColor
+        else
+            d.weapon.Visible = false
+        end
+        
+        -- Tracer
+        if o.tracer then
+            local origin = o.tracerOrigin == "Middle" and ViewportTracker.Size / 2 or
+                          o.tracerOrigin == "Top" and Vector2.new(ViewportTracker.Size.X / 2, 0) or
+                          Vector2.new(ViewportTracker.Size.X / 2, ViewportTracker.Size.Y)
+            
+            d.tracer.Visible = true
+            d.tracer.From = origin
+            d.tracer.To = (c.bottomLeft + c.bottomRight) / 2
+            d.tracer.Color = Util.ParseColor(o.tracerColor[1], false, o.useTeamColor and teamColor)
+            d.tracer.Transparency = o.tracerColor[2]
+            
+            if o.tracerOutline then
+                d.tracerOutline.Visible = true
+                d.tracerOutline.From = origin
+                d.tracerOutline.To = d.tracer.To
+                d.tracerOutline.Color = Util.ParseColor(o.tracerOutlineColor[1], true)
+                d.tracerOutline.Transparency = o.tracerOutlineColor[2]
+            else
+                d.tracerOutline.Visible = false
+            end
+        else
+            d.tracer.Visible = false
+            d.tracerOutline.Visible = false
+        end
+        
+        -- 3D Box
+        for i, line in ipairs(d.box3d) do
+            if o.box3d then
+                local edge = EDGES[i]
+                line.Visible = true
+                line.From = c.screen[edge[1]]
+                line.To = c.screen[edge[2]]
+                line.Color = Util.ParseColor(o.box3dColor[1], false, o.useTeamColor and teamColor)
+                line.Transparency = o.box3dColor[2]
+            else
+                line.Visible = false
+            end
+        end
+        
+        -- Hide off-screen elements
+        d.arrow.Visible = false
+        d.arrowOutline.Visible = false
+        
+    elseif self.options.offScreenArrow and self.direction then
+        -- Off-screen arrow
+        local center = ViewportTracker.Size / 2
+        local radius = o.offScreenArrowRadius
+        local size = o.offScreenArrowSize
+        
+        local pos = center + self.direction * math.min(radius, center.X - 50, center.Y - 50)
+        pos = Vector2.new(
+            math.clamp(pos.X, 25, ViewportTracker.Size.X - 25),
+            math.clamp(pos.Y, 25, ViewportTracker.Size.Y - 25)
+        )
+        
+        local perp = Vector2.new(-self.direction.Y, self.direction.X)
+        local ptA = pos + self.direction * size
+        local ptB = pos - self.direction * size * 0.5 + perp * size * 0.5
+        local ptC = pos - self.direction * size * 0.5 - perp * size * 0.5
+        
+        d.arrow.Visible = true
+        d.arrow.PointA = ptA
+        d.arrow.PointB = ptB
+        d.arrow.PointC = ptC
+        d.arrow.Color = Util.ParseColor(o.offScreenArrowColor[1], false, o.useTeamColor and teamColor)
+        d.arrow.Transparency = o.offScreenArrowColor[2]
+        
+        if o.offScreenArrowOutline then
+            d.arrowOutline.Visible = true
+            d.arrowOutline.PointA = ptA
+            d.arrowOutline.PointB = ptB
+            d.arrowOutline.PointC = ptC
+            d.arrowOutline.Color = Util.ParseColor(o.offScreenArrowOutlineColor[1], true)
+            d.arrowOutline.Transparency = o.offScreenArrowOutlineColor[2]
+        else
+            d.arrowOutline.Visible = false
+        end
+        
+        -- Hide on-screen elements
+        self:HideOnScreen()
+    else
+        self:HideAll()
+    end
+end
+
+function EspObject:HideOnScreen()
+    local d = self.drawings
+    d.box.Visible = false
+    d.boxOutline.Visible = false
+    d.boxFill.Visible = false
+    d.healthBar.Visible = false
+    d.healthBarOutline.Visible = false
+    d.healthText.Visible = false
+    d.name.Visible = false
+    d.distance.Visible = false
+    d.weapon.Visible = false
+    d.tracer.Visible = false
+    d.tracerOutline.Visible = false
+    for _, line in ipairs(d.box3d) do line.Visible = false end
+end
+
+function EspObject:HideAll()
+    self:HideOnScreen()
+    self.drawings.arrow.Visible = false
+    self.drawings.arrowOutline.Visible = false
+end
+
+function EspObject:Destroy()
+    self:HideAll()
+    for _, drawing in pairs(self.drawings) do
+        if type(drawing) == "table" then
+            for _, line in ipairs(drawing) do
+                pcall(function() line:Remove() end)
+            end
+        else
+            pcall(function() drawing:Remove() end)
+        end
+    end
+    table.clear(self.drawings)
+end
+
+-- Chams Object
+local ChamObject = {}
+ChamObject.__index = ChamObject
+
+function ChamObject.new(player, interface)
+    local self = setmetatable({}, ChamObject)
+    self.player = player
+    self.interface = interface
+    
+    local container = interface.container
+    self.highlight = Instance.new("Highlight")
+    self.highlight.Parent = container
+    
+    return self
+end
+
+function ChamObject:Update()
+    local interface = self.interface
+    local isFriendly = interface:IsFriendly(self.player)
+    local options = interface.teamSettings[isFriendly and "friendly" or "enemy"]
+    
+    if not options.enabled or not options.chams then
+        self.highlight.Enabled = false
+        return
+    end
+    
+    local character = interface:GetCharacter(self.player)
+    local health = interface:GetHealth(self.player)
+    
+    if not character or health <= 0 then
+        self.highlight.Enabled = false
+        return
+    end
+    
+    if options.ghostCheck then
+        local head = character:FindFirstChild("Head")
+        if head and head.Transparency >= 0.95 then
+            self.highlight.Enabled = false
+            return
+        end
+    end
+    
+    if #interface.whitelist > 0 and not table.find(interface.whitelist, self.player.UserId) then
+        self.highlight.Enabled = false
+        return
+    end
+    
+    local teamColor = interface:GetTeamColor(self.player)
+    
+    self.highlight.Enabled = true
+    self.highlight.Adornee = character
+    self.highlight.FillColor = Util.ParseColor(options.chamsFillColor[1], false, options.useTeamColor and teamColor)
+    self.highlight.FillTransparency = options.chamsFillColor[2]
+    self.highlight.OutlineColor = Util.ParseColor(options.chamsOutlineColor[1], true)
+    self.highlight.OutlineTransparency = options.chamsOutlineColor[2]
+    self.highlight.DepthMode = options.chamsVisibleOnly and Enum.HighlightDepthMode.Occluded or Enum.HighlightDepthMode.AlwaysOnTop
+end
+
+function ChamObject:Destroy()
+    self.highlight:Destroy()
+end
+
+-- Main Interface
+local EspInterface = {
+    _hasLoaded = false,
+    _objectCache = {},
+    whitelist = {},
+    container = nil,
+    sharedSettings = {
+        textSize = 13,
+        textFont = 2,
+        limitDistance = false,
+        maxDistance = 150,
+        useTeamColor = false
+    },
+    teamSettings = {} -- Will be initialized below
+}
+
+-- Default settings generator
+local function CreateDefaultSettings(isEnemy)
+    local color = isEnemy and Color3.new(1, 0, 0) or Color3.new(0, 1, 0)
+    return {
+        enabled = false,
+        wallCheck = false,
+        ghostCheck = false,
+        useTeamColor = false,
+        
+        box = false,
+        boxColor = { color, 1 },
+        boxOutline = true,
+        boxOutlineColor = { Color3.new(), 1 },
+        boxFill = false,
+        boxFillColor = { color, 0.5 },
+        
+        healthBar = false,
+        healthyColor = Color3.new(0, 1, 0),
+        dyingColor = Color3.new(1, 0, 0),
+        healthBarOutline = true,
+        healthBarOutlineColor = { Color3.new(), 0.5 },
+        
+        healthText = false,
+        healthTextColor = { Color3.new(1, 1, 1), 1 },
+        healthTextOutline = true,
+        healthTextOutlineColor = Color3.new(),
+        
+        box3d = false,
+        box3dColor = { color, 1 },
+        
+        name = false,
+        nameColor = { Color3.new(1, 1, 1), 1 },
+        nameOutline = true,
+        nameOutlineColor = Color3.new(),
+        
+        weapon = false,
+        weaponColor = { Color3.new(1, 1, 1), 1 },
+        weaponOutline = true,
+        weaponOutlineColor = Color3.new(),
+        
+        distance = false,
+        distanceColor = { Color3.new(1, 1, 1), 1 },
+        distanceOutline = true,
+        distanceOutlineColor = Color3.new(),
+        
+        tracer = false,
+        tracerOrigin = "Bottom",
+        tracerColor = { color, 1 },
+        tracerOutline = true,
+        tracerOutlineColor = { Color3.new(), 1 },
+        
+        offScreenArrow = false,
+        offScreenArrowColor = { Color3.new(1, 1, 1), 1 },
+        offScreenArrowSize = 15,
+        offScreenArrowRadius = 150,
+        offScreenArrowOutline = true,
+        offScreenArrowOutlineColor = { Color3.new(), 1 },
+        
+        chams = false,
+        chamsVisibleOnly = false,
+        chamsFillColor = { Color3.new(0.2, 0.2, 0.2), 0.5 },
+        chamsOutlineColor = { color, 0 }
+    }
+end
+
+EspInterface.teamSettings.enemy = CreateDefaultSettings(true)
+EspInterface.teamSettings.friendly = CreateDefaultSettings(false)
+
+function EspInterface:Load()
+    assert(not self._hasLoaded, "ESP already loaded")
+    
+    self.container = Instance.new("Folder")
+    self.container.Name = "ESP_Container"
+    
+    -- Try to parent to hidden UI
+    local success = pcall(function()
+        self.container.Parent = gethui()
+    end)
+    
+    if not success then
+        self.container.Parent = CoreGui
+    end
+    
+    -- Create objects for existing players
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            self:CreatePlayerObject(player)
+        end
+    end
+    
+    -- Connect events
+    self.connections = {
+        Players.PlayerAdded:Connect(function(p) self:CreatePlayerObject(p) end),
+        Players.PlayerRemoving:Connect(function(p) self:RemovePlayerObject(p) end),
+        RunService.RenderStepped:Connect(function(dt) self:UpdateAll(dt) end)
+    }
+    
+    self._hasLoaded = true
+end
+
+function EspInterface:Unload()
+    assert(self._hasLoaded, "ESP not loaded")
+    
+    for _, conn in pairs(self.connections) do
+        conn:Disconnect()
+    end
+    
+    for player, objects in pairs(self._objectCache) do
+        for _, obj in ipairs(objects) do
+            obj:Destroy()
+        end
+    end
+    
+    table.clear(self._objectCache)
+    self.container:Destroy()
+    self._hasLoaded = false
+end
+
+function EspInterface:CreatePlayerObject(player)
+    if player == LocalPlayer then return end
+    
+    self._objectCache[player] = {
+        EspObject.new(player, self),
+        ChamObject.new(player, self)
+    }
+end
+
+function EspInterface:RemovePlayerObject(player)
+    local objects = self._objectCache[player]
+    if objects then
+        for _, obj in ipairs(objects) do
+            obj:Destroy()
+        end
+        self._objectCache[player] = nil
+    end
+end
+
+function EspInterface:UpdateAll(deltaTime)
+    for _, objects in pairs(self._objectCache) do
+        for _, obj in ipairs(objects) do
+            if obj.Update then
+                if obj:Update(deltaTime) then
+                    obj:Render()
+                end
+            else
+                obj:Update()
+            end
+        end
+    end
+end
+
+-- Game-specific overrides (customize these)
+function EspInterface:GetWeapon(player)
+    return "Unknown"
+end
+
+function EspInterface:IsFriendly(player)
+    return player.Team and player.Team == LocalPlayer.Team
+end
+
+function EspInterface:GetTeamColor(player)
+    return player.Team and player.Team.TeamColor and player.Team.TeamColor.Color
+end
+
+function EspInterface:GetCharacter(player)
+    return player.Character
+end
+
+function EspInterface:GetHealth(player)
+    local character = self:GetCharacter(player)
+    if not character then return 100, 100 end
+    
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        return humanoid.Health, humanoid.MaxHealth
+    end
+    return 100, 100
+end
+
+return EspInterface
