@@ -803,4 +803,7 @@ function EspInterface:GetHealth(player)
     return 100, 100
 end
 
-return EspInterface
+local Sense = EspInterface
+-- Expose the old name for backward compatibility if anyone requires it
+getfenv().EspInterface = Sense  
+return Sense
